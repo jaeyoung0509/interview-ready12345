@@ -773,8 +773,189 @@ HTTP query params
 - saturation: Lambda concurrency, queue age, DB connection, throttling
 - business: 승인율, 상태별 체류, 취소율, 대사 불일치, 정산 지연
 
+### 9. Lambda에서 실제로 봐야 하는 메트릭
+
+#### 예상 질문
+
+`Lambda를 운영하면서 어떤 메트릭을 봤나요?`
+
+#### 1분 모범 답변
+
+> Lambda 하나만 보지 않고 요청 진입점, Lambda runtime, event source, downstream, business outcome을 한 흐름으로 봤습니다. Lambda 기본 메트릭에서는 Invocations 대비 Errors 비율, Duration의 p50, p95, p99, Throttles와 ConcurrentExecutions를 봤습니다. 비동기 호출은 AsyncEventAge, DynamoDB Streams는 IteratorAge, SQS는 ApproximateAgeOfOldestMessage와 DLQ를 함께 봤습니다. Powertools Metrics로는 결제 승인과 실패, 외부기관 호출 latency, retry, idempotency hit, 상태별 처리 건수를 EMF로 발행했습니다. 장애 시에는 X-Ray에서 API Gateway, Lambda, DynamoDB, 외부 API 중 어느 구간이 느린지 확인하고 같은 trace ID와 event ID로 구조화 로그를 연결했습니다. 기술 오류율과 결제 거절 같은 정상적인 business failure는 별도 metric으로 구분했습니다.
+
+#### Lambda 기본 메트릭
+
+| 메트릭 | 무엇을 알려주는가 | 보는 방법 |
+|---|---|---|
+| `Invocations` | 요청량과 실행량 | `Sum`, 이전 시간대와 배포 전후 비교 |
+| `Errors` | handler exception과 runtime error | `Errors / Invocations` 비율로 alarm. raw count만 보면 traffic 증가와 구분하기 어려움 |
+| `Duration` | handler 실행 시간 | Average보다 p50, p95, p99. function timeout에 가까워지는지도 확인 |
+| `Throttles` | concurrency 부족으로 실행이 거절된 횟수 | `Sum`, account와 function concurrency를 함께 확인 |
+| `ConcurrentExecutions` | 동시 실행량 | peak와 quota, reserved concurrency 비교 |
+| `UnreservedConcurrentExecutions` | account 공용 concurrency 사용량 | 다른 Lambda가 capacity를 고갈시키는지 확인 |
+| `AsyncEventAge` | async event가 enqueue된 뒤 실행될 때까지의 나이 | Errors와 Throttles 증가를 함께 확인 |
+| `DeadLetterErrors` | Lambda가 async event를 DLQ로 보내지 못함 | DLQ 권한, destination 설정과 함께 즉시 확인 |
+| `DestinationDeliveryFailures` | async destination 전달 실패 | 함수 성공과 후속 전달 성공을 분리 |
+| `IteratorAge` | Stream record 생성부터 처리까지의 지연 | DynamoDB Streams나 Kinesis backlog의 핵심 signal |
+| `ProvisionedConcurrencySpilloverInvocations` | provisioned capacity를 넘어 on-demand로 실행된 수 | cold start 재발 가능성과 용량 부족 확인 |
+| `ProvisionedConcurrencyUtilization` | provisioned concurrency 사용률 | latency와 비용 사이의 right-sizing |
+
+#### Duration을 볼 때 자주 하는 실수
+
+- Average 하나만 보면 느린 tail latency가 가려진다.
+- Lambda `Duration`과 사용자가 느끼는 API latency는 다르다. API Gateway `Latency`에는 gateway overhead가 포함되고 `IntegrationLatency`는 backend 구간을 보여준다.
+- queue consumer는 handler duration이 짧아도 queue wait가 길 수 있다. end-to-end latency와 message age를 따로 본다.
+- timeout 직전의 느린 요청은 error가 되기 전부터 p99와 remaining time으로 감지한다.
+- cold start 분석은 `Init Duration`과 warm handler duration을 구분한다.
+
+#### Trigger별로 같이 볼 메트릭
+
+| Trigger | 함께 볼 메트릭 | 대표적인 해석 |
+|---|---|---|
+| API Gateway | `Latency`, `IntegrationLatency`, `4XXError`, `5XXError` | 두 latency 차이가 크면 gateway나 network 구간, 둘 다 크면 backend 가능성 |
+| SQS | `ApproximateAgeOfOldestMessage`, visible, not visible, DLQ age | queue age가 계속 오르면 consumer 처리량이나 downstream 병목 |
+| DynamoDB Streams | Lambda `IteratorAge`, Errors, Throttles | age 증가와 error가 함께면 poison batch, throttle만 늘면 concurrency 확인 |
+| DynamoDB | throttled requests, system errors, latency, conditional check failure | capacity 문제와 정상적인 optimistic concurrency 충돌을 분리 |
+| 외부 API | latency, timeout, 429, 5xx, business error | 우리 코드와 provider 장애를 구분 |
+
+### 10. Powertools Metrics로 무엇을 발행했나
+
+#### 예상 질문
+
+`기본 Lambda 메트릭이 있는데 Powertools Metrics는 왜 썼나요?`
+
+#### 모범 답변
+
+> 기본 메트릭은 함수가 실행됐고 느렸거나 실패했다는 사실은 알려주지만 결제 승인인지 신용평가인지, 어느 외부기관에서 어떤 business outcome이 났는지는 알기 어렵습니다. Powertools Metrics는 CloudWatch Embedded Metric Format을 이용해 로그 한 번으로 여러 custom metric을 발행할 수 있어 사용했습니다. 예를 들어 `PaymentApproved`, `PaymentDeclined`, `ExternalApiLatency`, `RetryAttempt`, `IdempotencyHit`, `TaskStateTransition`을 service, environment, provider, operation 같은 낮은 cardinality dimension으로 분리했습니다. payment ID나 customer ID는 dimension으로 넣지 않고 구조화 로그나 trace annotation으로만 검색했습니다.
+
+#### 추천 custom metrics
+
+| 영역 | 메트릭 예시 | Dimension 예시 |
+|---|---|---|
+| 결제 | `PaymentAttempt`, `PaymentApproved`, `PaymentFailed` | provider, payment_method, normalized_result |
+| 취소 | `CancelRequested`, `CancelSucceeded`, `CancelUnknown` | provider, full_or_partial |
+| 외부 연동 | `ExternalApiLatency`, `ExternalApiError` | provider, operation, error_category |
+| 비동기 | `EventProcessed`, `EventFailed`, `RetryAttempt` | event_type, consumer, error_category |
+| 멱등성 | `IdempotencyHit`, `IdempotencyConflict`, `StaleClaimRecovered` | operation |
+| Outbox | `OutboxPublished`, `OutboxPublishFailed`, `OutboxLag` | event_type |
+| 락 | `LockAcquireFailed`, `LockWaitTime`, `LeaseExpired` | operation. customer ID는 넣지 않음 |
+| 업무 상태 | `TaskStateTransition`, `TaskCompletionLatency` | task_type, final_state |
+| 대사 | `ReconciliationMismatch`, `MismatchAmount` | provider, mismatch_type |
+
+#### Powertools Python 예시
+
+```python
+from aws_lambda_powertools import Metrics
+from aws_lambda_powertools.metrics import MetricUnit
+
+metrics = Metrics(namespace="Paymonths", service="payment")
+metrics.set_default_dimensions(environment="prod")
+
+
+@metrics.log_metrics(capture_cold_start_metric=True)
+def handler(event, context):
+    result = approve_payment(event)
+
+    metrics.add_metric(
+        name="PaymentApproved",
+        unit=MetricUnit.Count,
+        value=1,
+    )
+    metrics.add_dimension(name="provider", value=result.provider)
+    metrics.add_metadata(key="payment_id", value=result.payment_id)
+
+    return result.to_dict()
+```
+
+#### 이 코드에 대한 심화 설명
+
+- `log_metrics`가 invocation 종료 시 EMF를 flush하므로 직접 `PutMetricData`를 호출하는 것보다 application 경로와 결합이 적다.
+- `ColdStart`는 cold invocation에서만 별도 metric으로 발행된다. warm invocation마다 0을 내보내지 않으므로 sparse metric이라는 점을 알고 해석한다.
+- provider처럼 경우의 수가 작고 고정된 값만 dimension으로 사용한다.
+- payment ID, customer ID, request ID를 dimension으로 쓰면 custom metric 조합이 폭증해 비용과 조회성이 나빠진다. 이런 값은 metadata 또는 log field에 둔다.
+- error path에서도 metric이 flush되는지 decorator 위치와 exception 흐름을 테스트한다.
+- metric 이름, unit, dimension set을 팀 contract로 고정한다. 같은 이름에 다른 unit을 섞지 않는다.
+
+#### Alarm은 어떤 식으로 잡나
+
+> 고정된 숫자를 모든 함수에 똑같이 적용하지 않고 SLO와 평소 baseline을 기준으로 잡습니다. 결제 API는 5분 window의 error rate와 p99 latency처럼 빠른 alarm을 두고, 낮은 traffic 함수는 최소 invocation 수 조건을 함께 둡니다. queue는 단순 depth보다 oldest message age가 업무 지연을 잘 나타냅니다. warning은 운영 채널, 실제 고객 영향이 큰 page는 on-call로 severity를 나눕니다. 배포 직후 canary나 version dimension으로 regression을 확인합니다.
+
+### 11. X-Ray에서 무엇을 봤나
+
+#### 예상 질문
+
+`X-Ray로 구체적으로 무엇을 추적했나요?`
+
+#### 모범 답변
+
+> 전체 요청의 root trace 아래에서 Lambda handler와 DynamoDB, 다른 내부 API, KCB나 KCS 같은 외부 HTTP 호출을 subsegment로 나눠 봤습니다. service map으로 오류가 어느 dependency에 집중되는지 보고, trace detail에서는 각 subsegment latency와 fault, error, throttle을 확인했습니다. annotation에는 검색이 필요한 낮은 cardinality 값이나 operation을 넣고, 상세 payload는 metadata에 넣더라도 개인정보와 크기를 제한했습니다. 비동기 경계에서는 trace ID만으로 모든 처리가 자동 연결된다고 가정하지 않고 event ID를 message attribute와 구조화 로그에 함께 전달했습니다.
+
+#### X-Ray 용어를 정확히 말하기
+
+- Lambda service가 invocation을 나타내는 root segment를 만든다.
+- application의 X-Ray SDK와 Powertools Tracer는 그 아래 subsegment를 만든다.
+- SDK는 segment와 subsegment document를 Lambda 환경의 X-Ray daemon에 보낸다.
+- daemon은 기본적으로 UDP port 2000에서 trace document를 받고 X-Ray service로 batch upload한다.
+- UDP를 쓰는 이유는 application 요청을 trace 전송 때문에 block시키지 않기 위해서다. 따라서 trace 전송 실패가 business request 실패로 번지지 않게 해야 한다.
+
+### 12. 내가 겪었던 X-Ray UDP segment 오류
+
+#### 가장 가능성 높은 원인
+
+네가 기억하는 로그가 아래와 비슷했다면 원인은 trace document가 너무 커져 UDP datagram 한도를 넘긴 것이다.
+
+```text
+aws_xray_sdk.core.emitters.udp_emitter
+failed to send data to X-Ray daemon
+OSError: [Errno 40 or 90] Message too long
+```
+
+X-Ray segment document는 최대 64KB다. request와 response body, 큰 exception, 많은 metadata, SQL statement, 반복문 안에서 만든 수많은 subsegment를 한 segment에 계속 붙이면 document가 커진다. SDK가 이를 한 UDP datagram으로 daemon에 보내려다 운영체제에서 `Message too long`이 나거나 X-Ray service에서 oversized segment가 거부될 수 있다.
+
+#### 면접용 모범 답변
+
+> X-Ray SDK는 Lambda 환경의 daemon에 trace document를 UDP 2000번 포트로 비동기 전송합니다. 당시 한 요청에서 외부 호출과 반복 작업의 subsegment가 많이 생성됐고 metadata도 크게 붙으면서 segment document가 UDP 한 번에 보낼 수 있는 크기와 X-Ray의 64KB 제한을 넘었습니다. 그래서 udp emitter에서 `Message too long` 형태의 전송 오류가 발생했던 것으로 기억합니다. 해결할 때는 request와 response 전체를 capture하지 않고 필요한 field만 남겼고, 큰 metadata와 고 cardinality annotation을 제거했습니다. 반복 작업은 모든 item을 subsegment로 만들기보다 집계 metric으로 남기고, SDK의 subsegment streaming이 동작하도록 구성했습니다. trace 전송 실패가 결제 로직을 실패시키지 않도록 telemetry failure와 business failure도 분리했습니다.
+
+#### 원인을 확인하는 순서
+
+1. 정확한 로그가 `Message too long`인지 확인한다.
+2. X-Ray SDK debug log 또는 serialize 직전 크기로 segment document가 64KB에 가까웠는지 본다.
+3. Powertools Tracer의 response와 error capture, 직접 추가한 metadata 크기를 확인한다.
+4. loop 안에서 subsegment를 무제한 생성했는지 확인한다.
+5. HTTP body, SQL query, exception stack, 외부 response를 통째로 기록했는지 확인한다.
+6. 같은 요청의 실행 시간이 길어 root segment에 지나치게 많은 작업이 누적됐는지 확인한다.
+
+#### 개선 방법
+
+- Powertools Tracer의 response capture가 필요하지 않다면 끄고 민감정보와 큰 payload를 기록하지 않는다.
+- metadata는 debug dump가 아니라 작은 진단 정보만 넣는다.
+- 검색할 값만 annotation으로 두고 payment ID 같은 고 cardinality 값의 사용 범위를 제한한다.
+- 반복 item마다 subsegment를 만들지 않고 batch 단위 subsegment와 count, latency metric을 사용한다.
+- 긴 작업은 queue나 workflow step으로 나눠 trace와 failure boundary를 작게 만든다.
+- X-Ray SDK의 subsegment streaming threshold를 검토해 완료된 subsegment가 root 종료 전 daemon으로 전송되게 한다.
+- trace sampling을 조정하되, sampling은 segment 하나의 크기 문제를 근본적으로 고치는 수단이 아니다.
+- telemetry code가 예외를 business handler 밖으로 전파하지 않는지 failure injection test를 한다.
+
+#### 다른 오류와 구분하기
+
+| 로그 | 더 가능성 높은 원인 |
+|---|---|
+| `Message too long` | segment document 또는 UDP datagram 크기 초과 |
+| `failed to send data to X-Ray daemon`, connection refused | daemon 주소나 port 설정 문제. 일반 Lambda에서는 daemon을 AWS가 관리하므로 custom 환경 변수를 확인 |
+| `SegmentNotFoundException` 또는 `cannot find the current segment` | async, thread, context 전파 또는 segment lifecycle 문제. UDP 크기 문제가 아님 |
+| `Already ended segment/subsegment` | subsegment를 두 번 닫거나 잘못된 순서로 닫음 |
+| trace가 일부만 보이고 SDK 오류 없음 | sampling, UDP 유실, context propagation, 권한 또는 unsupported boundary 확인 |
+
+정확한 과거 로그를 찾기 전에는 `UDP라서 에러가 났다`고만 단정하지 않는다. 가장 안전한 표현은 `X-Ray SDK가 daemon으로 UDP 전송하는 구조에서 oversized segment로 추정되는 emitter 오류를 겪었고, 정확한 로그가 Message too long이었는지는 면접 전 확인하겠다`이다.
+
 #### 공식 참고 자료
 
+- [AWS Lambda metrics 종류](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-metrics-types.html)
+- [AWS Serverless Lens의 권장 메트릭과 알람](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/opex-metrics-and-alerts.html)
+- [Powertools for AWS Lambda Python Metrics](https://docs.powertools.aws.dev/lambda/python/latest/core/metrics/)
+- [AWS X-Ray trace data 전송과 64KB segment 제한](https://docs.aws.amazon.com/xray/latest/devguide/xray-api-sendingdata.html)
+- [AWS X-Ray Python SDK daemon 설정](https://docs.aws.amazon.com/xray/latest/devguide/xray-sdk-python-configuration.html)
+- [AWS X-Ray에서 OpenTelemetry로의 전환 가이드](https://docs.aws.amazon.com/xray/latest/devguide/xray-sdk-migration.html)
 - [AWS Lambda cold starts](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html)
 - [AWS Lambda Provisioned Concurrency](https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html)
 - [PostgreSQL multicolumn indexes](https://www.postgresql.org/docs/current/indexes-multicolumn.html)
